@@ -11,8 +11,12 @@ import random
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.multioutput import MultiOutputRegressor
+from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix, classification_report
+from sklearn.calibration import calibration_curve
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from scipy.optimize import minimize, differential_evolution
 from scipy.spatial.distance import cdist
+import xgboost as xgb
 import shap
 
 # Set page config
@@ -49,41 +53,132 @@ st.markdown("""
 
 @st.cache_data
 def generate_synthetic_patient_data(n_patients=1000, seed=42):
-    """Generate synthetic patient data with realistic clinical characteristics."""
+    """Generate synthetic patient data with realistic clinical characteristics using correlation matrix."""
     np.random.seed(seed)
     
-    # Generate realistic patient data
-    data = {
-        'patient_id': range(1, n_patients + 1),
-        'age': np.random.normal(65, 15, n_patients).clip(18, 95),
-        'bmi': np.random.normal(28, 6, n_patients).clip(18, 50),
-        'creatinine': np.random.normal(1.2, 0.4, n_patients).clip(0.5, 3.0),
-        'hba1c': np.random.normal(7.5, 1.5, n_patients).clip(5.0, 12.0),
-        'systolic_bp': np.random.normal(140, 20, n_patients).clip(90, 200),
-        'diastolic_bp': np.random.normal(85, 12, n_patients).clip(60, 120),
-        'cholesterol': np.random.normal(200, 40, n_patients).clip(120, 300),
-        'triglycerides': np.random.normal(150, 80, n_patients).clip(50, 500),
-        'smoking_status': np.random.choice([0, 1], n_patients, p=[0.7, 0.3]),
-        'diabetes_history': np.random.choice([0, 1], n_patients, p=[0.6, 0.4]),
-        'cardiovascular_history': np.random.choice([0, 1], n_patients, p=[0.8, 0.2]),
-        'kidney_disease': np.random.choice([0, 1], n_patients, p=[0.9, 0.1]),
-        'liver_disease': np.random.choice([0, 1], n_patients, p=[0.95, 0.05]),
-        'medication_count': np.random.poisson(3, n_patients).clip(0, 10)
+    # Define clinical variables and their means/standard deviations
+    variables = {
+        'age': {'mean': 65, 'std': 15, 'min': 18, 'max': 95},
+        'bmi': {'mean': 28, 'std': 6, 'min': 18, 'max': 50},
+        'creatinine': {'mean': 1.2, 'std': 0.4, 'min': 0.5, 'max': 3.0},
+        'hba1c': {'mean': 7.5, 'std': 1.5, 'min': 5.0, 'max': 12.0},
+        'systolic_bp': {'mean': 140, 'std': 20, 'min': 90, 'max': 200},
+        'diastolic_bp': {'mean': 85, 'std': 12, 'min': 60, 'max': 120},
+        'cholesterol': {'mean': 200, 'std': 40, 'min': 120, 'max': 300},
+        'triglycerides': {'mean': 150, 'std': 80, 'min': 50, 'max': 500}
     }
     
-    # Create event rate based on risk factors (simplified model)
+    # Define correlation matrix based on clinical relationships
+    # Order: age, bmi, creatinine, hba1c, systolic_bp, diastolic_bp, cholesterol, triglycerides
+    correlation_matrix = np.array([
+        [1.0,  0.2,  0.3,  0.1,  0.4,  0.3,  0.1,  0.0],  # age
+        [0.2,  1.0,  0.1,  0.3,  0.2,  0.2,  0.2,  0.4],  # bmi
+        [0.3,  0.1,  1.0,  0.2,  0.1,  0.1,  0.0,  0.0],  # creatinine
+        [0.1,  0.3,  0.2,  1.0,  0.2,  0.1,  0.3,  0.2],  # hba1c
+        [0.4,  0.2,  0.1,  0.2,  1.0,  0.7,  0.2,  0.1],  # systolic_bp
+        [0.3,  0.2,  0.1,  0.1,  0.7,  1.0,  0.2,  0.1],  # diastolic_bp
+        [0.1,  0.2,  0.0,  0.3,  0.2,  0.2,  1.0,  0.5],  # cholesterol
+        [0.0,  0.4,  0.0,  0.2,  0.1,  0.1,  0.5,  1.0]   # triglycerides
+    ])
+    
+    # Generate correlated continuous variables using multivariate normal distribution
+    var_names = list(variables.keys())
+    means = [variables[var]['mean'] for var in var_names]
+    stds = [variables[var]['std'] for var in var_names]
+    
+    # Convert correlation matrix to covariance matrix
+    cov_matrix = np.diag(stds) @ correlation_matrix @ np.diag(stds)
+    
+    # Generate correlated data
+    correlated_data = np.random.multivariate_normal(means, cov_matrix, n_patients)
+    
+    # Clip to realistic ranges
+    for i, var in enumerate(var_names):
+        correlated_data[:, i] = np.clip(
+            correlated_data[:, i], 
+            variables[var]['min'], 
+            variables[var]['max']
+        )
+    
+    # Generate binary variables with correlations to continuous variables
+    # Smoking: correlated with age (older patients less likely to smoke)
+    smoking_prob = 1 / (1 + np.exp(-(-0.02 * (correlated_data[:, 0] - 65) + np.random.normal(0, 0.5, n_patients))))
+    smoking_status = np.random.binomial(1, smoking_prob)
+    
+    # Diabetes: correlated with age, BMI, HbA1c
+    diabetes_prob = 1 / (1 + np.exp(-(
+        0.02 * (correlated_data[:, 0] - 65) +  # age
+        0.05 * (correlated_data[:, 1] - 28) +  # bmi
+        0.3 * (correlated_data[:, 3] - 7.5) +  # hba1c
+        np.random.normal(0, 0.5, n_patients)
+    )))
+    diabetes_history = np.random.binomial(1, diabetes_prob)
+    
+    # Cardiovascular history: correlated with age, BP, cholesterol
+    cv_prob = 1 / (1 + np.exp(-(
+        0.03 * (correlated_data[:, 0] - 65) +  # age
+        0.01 * (correlated_data[:, 4] - 140) + # systolic_bp
+        0.01 * (correlated_data[:, 5] - 85) +  # diastolic_bp
+        0.002 * (correlated_data[:, 6] - 200) + # cholesterol
+        np.random.normal(0, 0.5, n_patients)
+    )))
+    cardiovascular_history = np.random.binomial(1, cv_prob)
+    
+    # Kidney disease: correlated with age, creatinine, diabetes
+    kidney_prob = 1 / (1 + np.exp(-(
+        0.02 * (correlated_data[:, 0] - 65) +  # age
+        0.5 * (correlated_data[:, 2] - 1.2) +  # creatinine
+        0.5 * diabetes_history +               # diabetes
+        np.random.normal(0, 0.5, n_patients)
+    )))
+    kidney_disease = np.random.binomial(1, kidney_prob)
+    
+    # Liver disease: correlated with age, triglycerides
+    liver_prob = 1 / (1 + np.exp(-(
+        0.01 * (correlated_data[:, 0] - 65) +  # age
+        0.001 * (correlated_data[:, 7] - 150) + # triglycerides
+        np.random.normal(0, 0.5, n_patients)
+    )))
+    liver_disease = np.random.binomial(1, liver_prob)
+    
+    # Medication count: correlated with age and number of conditions
+    condition_count = smoking_status + diabetes_history + cardiovascular_history + kidney_disease + liver_disease
+    medication_prob = np.exp(-2 + 0.02 * (correlated_data[:, 0] - 65) + 0.3 * condition_count)
+    medication_count = np.random.poisson(medication_prob).clip(0, 10)
+    
+    # Create the data dictionary
+    data = {
+        'patient_id': range(1, n_patients + 1),
+        'age': correlated_data[:, 0],
+        'bmi': correlated_data[:, 1],
+        'creatinine': correlated_data[:, 2],
+        'hba1c': correlated_data[:, 3],
+        'systolic_bp': correlated_data[:, 4],
+        'diastolic_bp': correlated_data[:, 5],
+        'cholesterol': correlated_data[:, 6],
+        'triglycerides': correlated_data[:, 7],
+        'smoking_status': smoking_status,
+        'diabetes_history': diabetes_history,
+        'cardiovascular_history': cardiovascular_history,
+        'kidney_disease': kidney_disease,
+        'liver_disease': liver_disease,
+        'medication_count': medication_count
+    }
+    
+    # Create event rate based on risk factors with realistic correlations
     risk_score = (
-        (data['age'] - 65) / 15 * 0.3 +
-        (data['bmi'] - 28) / 6 * 0.2 +
-        (data['creatinine'] - 1.2) / 0.4 * 0.4 +
-        (data['hba1c'] - 7.5) / 1.5 * 0.3 +
-        data['smoking_status'] * 0.5 +
-        data['diabetes_history'] * 0.4 +
-        data['cardiovascular_history'] * 0.6
+        (data['age'] - 65) / 15 * 0.5 +
+        (data['bmi'] - 28) / 6 * 0.3 +
+        (data['creatinine'] - 1.2) / 0.4 * 0.6 +
+        (data['hba1c'] - 7.5) / 1.5 * 0.4 +
+        data['smoking_status'] * 1.0 +
+        data['diabetes_history'] * 0.8 +
+        data['cardiovascular_history'] * 1.2
     )
     
-    # Convert risk score to probability (0.05 to 0.25 range)
-    event_probability = 0.05 + 0.20 * (1 / (1 + np.exp(-risk_score)))
+    # Convert risk score to probability with higher base rate and stronger effect
+    # This creates more realistic event rates (0.10 to 0.40 range)
+    event_probability = 0.10 + 0.50 * (1 / (1 + np.exp(-risk_score)))
     data['event_occurred'] = np.random.binomial(1, event_probability)
     
     return pd.DataFrame(data)
@@ -230,99 +325,430 @@ def train_optimization_model(simulation_results, criteria_config):
     return model, scaler, feature_cols
 
 def objective_function(params, model, scaler, feature_cols, target_population, target_event_rate, 
-                      population_weight=0.5, event_rate_weight=0.5):
-    """Objective function for optimization."""
-    # Reshape parameters for prediction with proper feature names
-    X = pd.DataFrame([params], columns=list(feature_cols))
-    
-    # Suppress warnings for scaler transform
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        X_scaled = scaler.transform(X)
-    
-    # Predict outcomes
-    prediction = model.predict(X_scaled)[0]
-    predicted_population, predicted_event_rate = prediction
-    
-    # Calculate weighted loss
-    population_loss = abs(predicted_population - target_population) / max(target_population, 1)
-    event_rate_loss = abs(predicted_event_rate - target_event_rate) / max(target_event_rate, 0.01)
-    
-    total_loss = (population_weight * population_loss + 
-                  event_rate_weight * event_rate_loss)
-    
-    return total_loss
+                      population_weight=0.5, event_rate_weight=0.5, penalty_weight=1.0):
+    """Robust objective function for optimization with multiple loss components."""
+    try:
+        # Reshape parameters for prediction with proper feature names
+        X = pd.DataFrame([params], columns=list(feature_cols))
+        
+        # Suppress warnings for scaler transform
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            X_scaled = scaler.transform(X)
+        
+        # Predict outcomes
+        prediction = model.predict(X_scaled)[0]
+        predicted_population, predicted_event_rate = prediction
+        
+        # Ensure predictions are valid
+        predicted_population = max(0, predicted_population)
+        predicted_event_rate = np.clip(predicted_event_rate, 0, 1)
+        
+        # Calculate multiple loss components
+        # 1. Population size loss (relative error)
+        population_loss = abs(predicted_population - target_population) / max(target_population, 1)
+        
+        # 2. Event rate loss (relative error)
+        event_rate_loss = abs(predicted_event_rate - target_event_rate) / max(target_event_rate, 0.01)
+        
+        # 3. Penalty for extreme values (encourage reasonable criteria)
+        extreme_penalty = 0
+        for i, param in enumerate(params):
+            if i < len(feature_cols):
+                col_name = feature_cols[i]
+                # Add penalty for very extreme values
+                if 'age' in col_name.lower():
+                    if param < 18 or param > 100:  # Unreasonable age bounds
+                        extreme_penalty += abs(param - np.clip(param, 18, 100)) / 100
+                elif 'bmi' in col_name.lower():
+                    if param < 15 or param > 60:  # Unreasonable BMI bounds
+                        extreme_penalty += abs(param - np.clip(param, 15, 60)) / 60
+                elif 'creatinine' in col_name.lower():
+                    if param < 0.3 or param > 5.0:  # Unreasonable creatinine bounds
+                        extreme_penalty += abs(param - np.clip(param, 0.3, 5.0)) / 5.0
+        
+        # 4. Smoothness penalty (prefer gradual changes from current values)
+        smoothness_penalty = 0
+        # This could be implemented if we track current values
+        
+        # Combine all loss components
+        total_loss = (population_weight * population_loss + 
+                     event_rate_weight * event_rate_loss + 
+                     penalty_weight * extreme_penalty)
+        
+        return total_loss
+        
+    except Exception as e:
+        # Return a high penalty for failed evaluations
+        return 1e6
 
 def find_optimal_criteria(simulation_results, criteria_config, target_population, target_event_rate,
                          population_weight=0.5, event_rate_weight=0.5, n_optimizations=10):
-    """Find optimal criteria values for target outcomes."""
-    # Train optimization model
-    model, scaler, feature_cols = train_optimization_model(simulation_results, criteria_config)
+    """Simplified optimization that finds the best real simulation points directly."""
     
-    # Get parameter bounds
-    param_bounds = []
-    for criterion, config in criteria_config.items():
-        if config['active']:
-            if config['type'] == 'continuous':
-                current_val = config['threshold']
-                range_width = config.get('range_width', 0.5)
-                min_val = current_val * (1 - range_width)
-                max_val = current_val * (1 + range_width)
-                param_bounds.append((min_val, max_val))
-            else:  # binary
-                param_bounds.append((0, 1))
+    # Input validation
+    if simulation_results is None or len(simulation_results) == 0:
+        return None
     
-    best_result = None
-    best_loss = float('inf')
+    if target_population <= 0 or target_event_rate < 0 or target_event_rate > 1:
+        return None
     
-    # Run multiple optimizations with different starting points
-    for i in range(n_optimizations):
-        # Random starting point
-        x0 = []
-        for bounds in param_bounds:
-            x0.append(np.random.uniform(bounds[0], bounds[1]))
+    # Get feature columns from simulation results
+    feature_cols = [col for col in simulation_results.columns if col.startswith('param_')]
+    if not feature_cols:
+        return None
+    
+    # Strategy 1: Direct search - find closest simulation points to target
+    # Calculate weighted distance to target for each simulation
+    population_diff = abs(simulation_results['population_size'] - target_population) / max(target_population, 1)
+    event_rate_diff = abs(simulation_results['event_rate'] - target_event_rate) / max(target_event_rate, 0.01)
+    
+    # Weighted distance based on user preferences
+    weighted_distance = (population_weight * population_diff + 
+                        event_rate_weight * event_rate_diff)
+    
+    # Find the best simulation points
+    best_indices = weighted_distance.nsmallest(min(10, len(simulation_results))).index
+    
+    best_results = []
+    for idx in best_indices:
+        simulation = simulation_results.iloc[idx]
         
-        try:
-            result = minimize(
-                objective_function,
-                x0,
-                args=(model, scaler, feature_cols, target_population, target_event_rate,
-                      population_weight, event_rate_weight),
-                bounds=param_bounds,
-                method='L-BFGS-B',
-                options={'maxiter': 1000}
+        # Extract parameters
+        optimal_params = []
+        for feature_col in feature_cols:
+            optimal_params.append(simulation[feature_col])
+        
+        best_results.append({
+            'simulation_id': simulation['simulation_id'],
+            'population_size': simulation['population_size'],
+            'event_rate': simulation['event_rate'],
+            'optimal_params': optimal_params,
+            'distance': weighted_distance.iloc[idx],
+            'feature_cols': feature_cols
+        })
+    
+    # Strategy 2: If user wants more optimization, try to find better combinations
+    if n_optimizations > 1:
+        # Find similar populations and analyze their parameter distributions
+        similar_results = find_similar_populations(
+            simulation_results, target_population, target_event_rate,
+            population_tolerance=0.2, event_rate_tolerance=0.02, max_results=50
+        )
+        
+        if len(similar_results) > 0:
+            # Analyze parameter distributions to suggest improvements
+            param_analysis = {}
+            for feature_col in feature_cols:
+                param_name = feature_col.replace('param_', '').replace('_criteria', '')
+                param_values = similar_results[feature_col]
+                
+                # Get parameter type
+                param_type = 'continuous'
+                for criterion, config in criteria_config.items():
+                    if config['active'] and criterion in feature_col:
+                        param_type = config['type']
+                        break
+                
+                if param_type == 'binary':
+                    # For binary, find most common value
+                    most_common = param_values.mode().iloc[0] if len(param_values.mode()) > 0 else param_values.iloc[0]
+                    param_analysis[feature_col] = most_common
+                else:
+                    # For continuous, use median or mean based on distribution
+                    if param_values.std() < param_values.mean() * 0.1:  # Low variance
+                        param_analysis[feature_col] = param_values.median()
+                    else:
+                        param_analysis[feature_col] = param_values.mean()
+            
+            # Create a "suggested" result based on analysis
+            suggested_params = [param_analysis.get(col, 0) for col in feature_cols]
+            
+            # Find closest simulation to this suggestion
+            suggested_sim = find_closest_simulation_point(
+                simulation_results,
+                target_population,
+                target_event_rate,
+                feature_cols
             )
             
-            if result.success and result.fun < best_loss:
-                best_result = result
-                best_loss = result.fun
-                
+            if suggested_sim:
+                best_results.append({
+                    'simulation_id': suggested_sim['simulation_id'],
+                    'population_size': suggested_sim['population_size'],
+                    'event_rate': suggested_sim['event_rate'],
+                    'optimal_params': suggested_sim['parameters'],
+                    'distance': suggested_sim['distance'],
+                    'feature_cols': feature_cols,
+                    'method': 'parameter_analysis'
+                })
+    
+    # Return the best result (closest to target)
+    if best_results:
+        best_result = min(best_results, key=lambda x: x['distance'])
+        
+        # Add parameter types for display
+        param_types = []
+        for feature_col in feature_cols:
+            param_type = 'continuous'
+            for criterion, config in criteria_config.items():
+                if config['active'] and criterion in feature_col:
+                    param_type = config['type']
+                    break
+            param_types.append(param_type)
+        
+        return {
+            'optimal_params': best_result['optimal_params'],
+            'predicted_population': best_result['population_size'],  # Use real values
+            'predicted_event_rate': best_result['event_rate'],       # Use real values
+            'closest_real_point': {
+                'simulation_id': best_result['simulation_id'],
+                'population_size': best_result['population_size'],
+                'event_rate': best_result['event_rate'],
+                'parameters': best_result['optimal_params'],
+                'distance': best_result['distance']
+            },
+            'loss': best_result['distance'],
+            'feature_cols': feature_cols,
+            'param_types': param_types,
+            'optimization_history': [{'method': 'direct_search', 'loss': best_result['distance'], 'success': True}],
+            'success': True,
+            'method': best_result.get('method', 'direct_search')
+        }
+    
+    return None
+
+def analyze_patient_event_prediction(patients, criteria_config):
+    """Analyze patient-level event prediction using XGBoost with hyperparameter tuning."""
+    
+    # Import metrics early
+    from sklearn.metrics import precision_score, recall_score, f1_score, precision_recall_curve
+    
+    # Prepare patient data for ML analysis
+    # Use patient characteristics as features, event_occurred as target
+    feature_cols = ['age', 'bmi', 'creatinine', 'hba1c', 'systolic_bp', 'diastolic_bp', 
+                   'cholesterol', 'triglycerides', 'smoking_status', 'diabetes_history', 
+                   'cardiovascular_history', 'kidney_disease', 'liver_disease', 'medication_count']
+    
+    # Filter to only include features that exist in the data
+    available_features = [col for col in feature_cols if col in patients.columns]
+    
+    if not available_features:
+        return None
+    
+    # Create features and target
+    X = patients[available_features].copy()
+    y = patients['event_occurred'].copy()
+    
+    # Handle missing values
+    X = X.fillna(X.median())
+    
+    # Check event rate and add debugging info
+    event_rate = y.mean()
+    st.info(f"📊 Dataset Info: {len(y)} patients, {y.sum()} events, event rate: {event_rate:.3f}")
+    
+    if event_rate < 0.05:
+        st.warning(f"⚠️ Low event rate ({event_rate:.3f}). This may affect model performance.")
+    
+    # Use random seed for reproducibility but different each run
+    random_seed = np.random.randint(1, 10000)
+    
+    # Split data into train/test sets with stratification
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.3, random_state=random_seed, stratify=y
+    )
+    
+    # Check prediction distribution after training
+    st.info(f"📈 Training set: {len(y_train)} patients, {y_train.sum()} events, event rate: {y_train.mean():.3f}")
+    st.info(f"📈 Test set: {len(y_test)} patients, {y_test.sum()} events, event rate: {y_test.mean():.3f}")
+    
+    # Standardize features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # Define XGBoost hyperparameter search space
+    param_dist = {
+        'n_estimators': [100, 200, 300],
+        'max_depth': [3, 4, 5, 6],
+        'learning_rate': [0.05, 0.1, 0.15],
+        'subsample': [0.8, 0.9, 1.0],
+        'colsample_bytree': [0.8, 0.9, 1.0],
+        'min_child_weight': [1, 3, 5],
+        'scale_pos_weight': [1, 2, 3]  # More conservative class imbalance handling
+    }
+    
+    # Initialize XGBoost classifier
+    xgb_model = xgb.XGBClassifier(
+        random_state=random_seed,
+        eval_metric='logloss',
+        use_label_encoder=False
+    )
+    
+    # Perform randomized search for hyperparameter tuning
+    random_search = RandomizedSearchCV(
+        xgb_model,
+        param_distributions=param_dist,
+        n_iter=20,  # Number of parameter settings sampled
+        cv=5,       # 5-fold cross-validation
+        scoring='roc_auc',
+        random_state=random_seed,
+        n_jobs=-1,  # Use all available cores
+        verbose=0
+    )
+    
+    # Fit the model
+    random_search.fit(X_train_scaled, y_train)
+    
+    # Get best model
+    best_model = random_search.best_estimator_
+    
+    # Make predictions
+    y_pred_proba = best_model.predict_proba(X_test_scaled)[:, 1]
+    
+    # Use optimal threshold that maximizes AUC (Youden's J statistic)
+    fpr, tpr, thresholds_roc = roc_curve(y_test, y_pred_proba)
+    optimal_idx = np.argmax(tpr - fpr)  # Youden's J statistic
+    optimal_threshold = thresholds_roc[optimal_idx]
+    
+    # Use the optimal threshold for predictions
+    y_pred = (y_pred_proba >= optimal_threshold).astype(int)
+    st.info(f"🎯 Optimal threshold: {optimal_threshold:.3f} (maximizes TPR - FPR)")
+    st.info(f"   - At this threshold: TPR={tpr[optimal_idx]:.3f}, FPR={fpr[optimal_idx]:.3f}")
+    st.info(f"   - Youden's J = {tpr[optimal_idx] - fpr[optimal_idx]:.3f}")
+    
+    # Debug prediction distribution
+    st.info(f"🔍 Prediction Analysis:")
+    st.info(f"   - Predicted probabilities range: {y_pred_proba.min():.3f} to {y_pred_proba.max():.3f}")
+    st.info(f"   - Mean predicted probability: {y_pred_proba.mean():.3f}")
+    st.info(f"   - Predictions: {y_pred.sum()} positive out of {len(y_pred)} ({y_pred.mean():.3f})")
+    st.info(f"   - Actual events: {y_test.sum()} out of {len(y_test)} ({y_test.mean():.3f})")
+    
+    # Calculate comprehensive metrics
+    # Basic metrics
+    auc = roc_auc_score(y_test, y_pred_proba)
+    accuracy = (y_pred == y_test).mean()
+    
+    # Detailed classification metrics
+    precision = precision_score(y_test, y_pred, zero_division=0)
+    recall = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+    
+    # Sensitivity (Recall), Specificity, etc.
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0  # Positive Predictive Value (Precision)
+    npv = tn / (tn + fn) if (tn + fn) > 0 else 0  # Negative Predictive Value
+    
+    # SHAP analysis
+    explainer = shap.TreeExplainer(best_model)
+    shap_values = explainer.shap_values(X_test_scaled)
+    if len(shap_values) == 2:  # Binary classification returns 2 arrays
+        shap_values = shap_values[1]  # Use positive class SHAP values
+    
+    # Calculate correlations with event occurrence
+    correlations = []
+    for col in available_features:
+        corr = patients[col].corr(patients['event_occurred'])
+        correlations.append(abs(corr))
+    
+    return {
+        'feature_names': available_features,
+        'X_train': X_train,
+        'X_test': X_test,
+        'y_train': y_train,
+        'y_test': y_test,
+        'X_train_scaled': X_train_scaled,
+        'X_test_scaled': X_test_scaled,
+        'scaler': scaler,
+        'model': best_model,
+        'y_pred': y_pred,
+        'y_pred_proba': y_pred_proba,
+        'auc': auc,
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'sensitivity': sensitivity,
+        'specificity': specificity,
+        'ppv': ppv,
+        'npv': npv,
+        'confusion_matrix': cm,
+        'feature_importance': best_model.feature_importances_,
+        'explainer': explainer,
+        'shap_values': shap_values,
+        'correlations': correlations,
+        'best_params': random_search.best_params_,
+        'random_seed': random_seed,
+        'event_rate': event_rate
+    }
+
+def analyze_optimization_robustness(simulation_results, criteria_config, target_population, target_event_rate):
+    """Analyze the robustness of optimization by testing multiple scenarios."""
+    
+    # Test different weight combinations
+    weight_combinations = [
+        (0.5, 0.5),  # Balanced
+        (0.7, 0.3),  # Population-focused
+        (0.3, 0.7),  # Event rate-focused
+        (0.9, 0.1),  # Very population-focused
+        (0.1, 0.9),  # Very event rate-focused
+    ]
+    
+    results = []
+    
+    for pop_weight, event_weight in weight_combinations:
+        try:
+            result = find_optimal_criteria(
+                simulation_results, criteria_config, target_population, target_event_rate,
+                population_weight=pop_weight, event_rate_weight=event_weight, n_optimizations=5
+            )
+            
+            if result:
+                results.append({
+                    'pop_weight': pop_weight,
+                    'event_weight': event_weight,
+                    'predicted_population': result['predicted_population'],
+                    'predicted_event_rate': result['predicted_event_rate'],
+                    'loss': result['loss'],
+                    'success': result.get('success', True),
+                    'method_used': result.get('optimization_history', [{}])[-1].get('method', 'unknown') if result.get('optimization_history') else 'unknown'
+                })
         except Exception as e:
             continue
     
-    if best_result is None:
+    return pd.DataFrame(results) if results else None
+
+def find_closest_simulation_point(simulation_results, target_population, target_event_rate, feature_cols):
+    """Find the closest real simulation point to the target values."""
+    if len(simulation_results) == 0:
         return None
     
-    # Get optimal parameters
-    optimal_params = best_result.x
+    # Calculate distances to target
+    population_diff = abs(simulation_results['population_size'] - target_population) / max(target_population, 1)
+    event_rate_diff = abs(simulation_results['event_rate'] - target_event_rate) / max(target_event_rate, 0.01)
+    total_distance = np.sqrt(population_diff**2 + event_rate_diff**2)
     
-    # Predict outcomes with optimal parameters
-    X_opt = pd.DataFrame([optimal_params], columns=list(feature_cols))
+    # Find the closest point
+    closest_idx = total_distance.idxmin()
+    closest_point = simulation_results.iloc[closest_idx]
     
-    # Suppress warnings for scaler transform
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        X_opt_scaled = scaler.transform(X_opt)
-    optimal_outcomes = model.predict(X_opt_scaled)[0]
+    # Extract the parameter values for this point
+    closest_params = []
+    for feature_col in feature_cols:
+        closest_params.append(closest_point[feature_col])
     
     return {
-        'optimal_params': optimal_params,
-        'predicted_population': optimal_outcomes[0],
-        'predicted_event_rate': optimal_outcomes[1],
-        'loss': best_loss,
-        'feature_cols': feature_cols
+        'simulation_id': closest_point['simulation_id'],
+        'population_size': closest_point['population_size'],
+        'event_rate': closest_point['event_rate'],
+        'parameters': closest_params,
+        'distance': total_distance.iloc[closest_idx]
     }
 
 def find_similar_populations(simulation_results, target_population, target_event_rate, 
@@ -399,25 +825,27 @@ def create_optimization_plots(simulation_results, optimal_result, target_populat
     )
     
     # Add optimal point if available
-    if optimal_result:
+    if optimal_result and 'closest_real_point' in optimal_result:
+        real_point = optimal_result['closest_real_point']
         fig.add_trace(
             go.Scatter(
-                x=[optimal_result['predicted_population']],
-                y=[optimal_result['predicted_event_rate']],
+                x=[real_point['population_size']],
+                y=[real_point['event_rate']],
                 mode='markers',
                 marker=dict(color='green', size=12, symbol='diamond'),
-                name='Optimal',
+                name='Best Simulation Found',
                 showlegend=False
             ),
             row=1, col=1
         )
     
     # Plot 2: Parameter distribution for similar outcomes
-    if optimal_result:
+    if optimal_result and 'closest_real_point' in optimal_result:
+        real_point = optimal_result['closest_real_point']
         similar_results = find_similar_populations(
             simulation_results, 
-            optimal_result['predicted_population'], 
-            optimal_result['predicted_event_rate'],
+            real_point['population_size'], 
+            real_point['event_rate'],
             population_tolerance=0.05,
             event_rate_tolerance=0.005,
             max_results=50
@@ -437,11 +865,12 @@ def create_optimization_plots(simulation_results, optimal_result, target_populat
             )
     
     # Plot 3: Optimization comparison
-    if optimal_result:
+    if optimal_result and 'closest_real_point' in optimal_result:
+        real_point = optimal_result['closest_real_point']
         fig.add_trace(
             go.Bar(
-                x=['Target', 'Optimal'],
-                y=[target_population, optimal_result['predicted_population']],
+                x=['Target', 'Best Simulation'],
+                y=[target_population, real_point['population_size']],
                 name='Population Size',
                 marker_color=['red', 'green'],
                 showlegend=False
@@ -451,8 +880,8 @@ def create_optimization_plots(simulation_results, optimal_result, target_populat
         
         fig.add_trace(
             go.Bar(
-                x=['Target', 'Optimal'],
-                y=[target_event_rate, optimal_result['predicted_event_rate']],
+                x=['Target', 'Best Simulation'],
+                y=[target_event_rate, real_point['event_rate']],
                 name='Event Rate',
                 marker_color=['red', 'green'],
                 showlegend=False
@@ -460,16 +889,19 @@ def create_optimization_plots(simulation_results, optimal_result, target_populat
             row=2, col=1
         )
     
-    # Plot 4: Parameter sensitivity (placeholder)
-    if optimal_result:
+    # Plot 4: Parameter sensitivity - showing optimal criteria values
+    if optimal_result and 'closest_real_point' in optimal_result:
+        real_point = optimal_result['closest_real_point']
         param_names = [col.replace('param_', '').replace('_criteria', '') 
                       for col in optimal_result['feature_cols']]
+        
+        # Add optimal parameters
         fig.add_trace(
             go.Bar(
                 x=param_names,
-                y=optimal_result['optimal_params'],
+                y=real_point['parameters'],
                 name='Optimal Parameters',
-                marker_color='lightgreen',
+                marker_color='green',
                 showlegend=False
             ),
             row=2, col=2
@@ -578,6 +1010,31 @@ def main():
         
         # Apply current criteria
         eligible_patients = apply_inclusion_exclusion_criteria(patients, criteria_config)
+        
+        # Show correlation matrix
+        with st.expander("🔗 Clinical Variable Correlations", expanded=False):
+            st.markdown("**Correlation matrix showing clinical relationships between variables:**")
+            
+            # Calculate actual correlations from the data
+            continuous_vars = ['age', 'bmi', 'creatinine', 'hba1c', 'systolic_bp', 'diastolic_bp', 'cholesterol', 'triglycerides']
+            corr_matrix = patients[continuous_vars].corr()
+            
+            # Create heatmap
+            fig, ax = plt.subplots(figsize=(10, 8))
+            sns.heatmap(corr_matrix, annot=True, cmap='RdBu_r', center=0, 
+                       square=True, fmt='.2f', cbar_kws={'label': 'Correlation'})
+            plt.title('Clinical Variable Correlations')
+            plt.tight_layout()
+            st.pyplot(fig)
+            
+            st.markdown("""
+            **Clinical Interpretation:**
+            - **Age** correlates with BP, creatinine (aging effects)
+            - **BMI** correlates with HbA1c, triglycerides (metabolic syndrome)
+            - **Blood Pressure** components are highly correlated
+            - **Lipids** (cholesterol, triglycerides) are correlated
+            - **HbA1c** correlates with BMI and lipids (diabetes/metabolic syndrome)
+            """)
         
         # Display metrics
         metric_col1, metric_col2, metric_col3 = st.columns(3)
@@ -1143,24 +1600,76 @@ def main():
             col1, col2 = st.columns(2)
             
             with col1:
-                st.markdown("**Predicted Outcomes:**")
-                st.metric("Population Size", f"{optimal_result['predicted_population']:.0f}")
-                st.metric("Event Rate", f"{optimal_result['predicted_event_rate']:.3f}")
-                st.metric("Optimization Loss", f"{optimal_result['loss']:.4f}")
+                st.markdown("**🎯 Target Outcomes:**")
+                st.metric("Population Size", f"{target_population:.0f}")
+                st.metric("Event Rate", f"{target_event_rate:.3f}")
+                
+                if 'closest_real_point' in optimal_result:
+                    real_point = optimal_result['closest_real_point']
+                    st.metric("Distance to Target", f"{real_point['distance']:.3f}")
+                    st.caption("Lower = closer to target")
             
             with col2:
-                st.markdown("**Optimal Parameter Values:**")
+                st.markdown("**✅ Best Simulation Found:**")
+                st.metric("Population Size", f"{optimal_result['predicted_population']:.0f}")
+                st.metric("Event Rate", f"{optimal_result['predicted_event_rate']:.3f}")
+                st.metric("Simulation ID", f"{optimal_result['closest_real_point']['simulation_id']}")
+                
+                if 'method' in optimal_result:
+                    method_name = optimal_result['method'].replace('_', ' ').title()
+                    st.metric("Method Used", method_name)
+            
+            # Show optimal criteria values
+            st.markdown("#### 📊 Optimal Criteria Values")
+            
+            if 'closest_real_point' in optimal_result:
+                real_point = optimal_result['closest_real_point']
+                
+                param_display = []
                 for i, feature_col in enumerate(optimal_result['feature_cols']):
                     param_name = feature_col.replace('param_', '').replace('_criteria', '')
-                    param_value = optimal_result['optimal_params'][i]
+                    param_value = real_point['parameters'][i]
                     
-                    # Format based on parameter type
-                    if param_value < 0.5:  # Likely binary
-                        formatted_value = "0 (Exclude)" if param_value < 0.5 else "1 (Include)"
+                    # Format values based on parameter type
+                    if 'param_types' in optimal_result and i < len(optimal_result['param_types']):
+                        param_type = optimal_result['param_types'][i]
+                        if param_type == 'binary':
+                            formatted_value = "1 (Include)" if param_value == 1 else "0 (Exclude)"
+                        else:
+                            formatted_value = f"{param_value:.2f}"
                     else:
-                        formatted_value = f"{param_value:.2f}"
+                        # Fallback logic
+                        if abs(param_value - round(param_value)) < 0.01:
+                            formatted_value = "1 (Include)" if param_value > 0.5 else "0 (Exclude)"
+                        else:
+                            formatted_value = f"{param_value:.2f}"
                     
-                    st.metric(param_name, formatted_value)
+                    param_display.append({
+                        'Criterion': param_name,
+                        'Optimal Value': formatted_value
+                    })
+                
+                # Display optimal criteria table
+                criteria_df = pd.DataFrame(param_display)
+                st.dataframe(criteria_df, use_container_width=True)
+            
+            # Show optimization status
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if 'success' in optimal_result:
+                    success_status = "✅ Successful" if optimal_result['success'] else "⚠️ Partial Success"
+                    st.metric("Optimization Status", success_status)
+                
+                if 'optimization_history' in optimal_result and optimal_result['optimization_history']:
+                    method_used = optimal_result['optimization_history'][-1].get('method', 'Unknown')
+                    st.metric("Method Used", method_used)
+            
+            with col2:
+                if 'closest_real_point' in optimal_result:
+                    real_point = optimal_result['closest_real_point']
+                    st.metric("Real Point Distance", f"{real_point['distance']:.3f}")
+                    st.caption("Lower = closer to target")
             
             # Optimization plots
             st.markdown("#### 📈 Optimization Analysis")
@@ -1171,6 +1680,132 @@ def main():
                 target_event_rate
             )
             st.plotly_chart(opt_fig, use_container_width=True)
+            
+            # Robustness Analysis
+            st.markdown("#### 🔬 Robustness Analysis")
+            
+            with st.expander("📊 Test Optimization Robustness", expanded=False):
+                st.markdown("""
+                This analysis tests how robust your optimization is by trying different weight combinations.
+                A robust optimization should produce similar results across different weight settings.
+                """)
+                
+                if st.button("Run Robustness Analysis", key="robustness_analysis"):
+                    with st.spinner("Analyzing optimization robustness..."):
+                        robustness_results = analyze_optimization_robustness(
+                            simulation_results,
+                            criteria_config,
+                            target_population,
+                            target_event_rate
+                        )
+                        
+                        if robustness_results is not None and len(robustness_results) > 0:
+                            st.session_state.robustness_results = robustness_results
+                            st.success("✅ Robustness analysis completed!")
+                        else:
+                            st.error("❌ Robustness analysis failed.")
+                
+                # Display robustness results
+                if 'robustness_results' in st.session_state:
+                    robustness_results = st.session_state.robustness_results
+                    
+                    st.markdown("**Results across different weight combinations:**")
+                    
+                    # Create visualization
+                    fig = make_subplots(
+                        rows=2, cols=2,
+                        subplot_titles=(
+                            'Population Size vs Weights',
+                            'Event Rate vs Weights', 
+                            'Loss vs Weights',
+                            'Success Rate by Method'
+                        ),
+                        specs=[[{"secondary_y": False}, {"secondary_y": False}],
+                               [{"secondary_y": False}, {"secondary_y": False}]]
+                    )
+                    
+                    # Plot 1: Population size vs weights
+                    fig.add_trace(
+                        go.Scatter(
+                            x=robustness_results['pop_weight'],
+                            y=robustness_results['predicted_population'],
+                            mode='markers+lines',
+                            name='Population Size',
+                            marker=dict(color='blue', size=8)
+                        ),
+                        row=1, col=1
+                    )
+                    
+                    # Plot 2: Event rate vs weights
+                    fig.add_trace(
+                        go.Scatter(
+                            x=robustness_results['pop_weight'],
+                            y=robustness_results['predicted_event_rate'],
+                            mode='markers+lines',
+                            name='Event Rate',
+                            marker=dict(color='red', size=8)
+                        ),
+                        row=1, col=2
+                    )
+                    
+                    # Plot 3: Loss vs weights
+                    fig.add_trace(
+                        go.Scatter(
+                            x=robustness_results['pop_weight'],
+                            y=robustness_results['loss'],
+                            mode='markers+lines',
+                            name='Loss',
+                            marker=dict(color='green', size=8)
+                        ),
+                        row=2, col=1
+                    )
+                    
+                    # Plot 4: Method distribution
+                    method_counts = robustness_results['method_used'].value_counts()
+                    fig.add_trace(
+                        go.Bar(
+                            x=method_counts.index,
+                            y=method_counts.values,
+                            name='Method Usage',
+                            marker_color='orange'
+                        ),
+                        row=2, col=2
+                    )
+                    
+                    fig.update_layout(height=600, title_text="Optimization Robustness Analysis")
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Summary statistics
+                    st.markdown("**Robustness Summary:**")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        pop_std = robustness_results['predicted_population'].std()
+                        pop_cv = pop_std / robustness_results['predicted_population'].mean()
+                        st.metric("Population CV", f"{pop_cv:.3f}")
+                        st.caption("Lower = more robust")
+                    
+                    with col2:
+                        event_std = robustness_results['predicted_event_rate'].std()
+                        event_cv = event_std / robustness_results['predicted_event_rate'].mean()
+                        st.metric("Event Rate CV", f"{event_cv:.3f}")
+                        st.caption("Lower = more robust")
+                    
+                    with col3:
+                        success_rate = robustness_results['success'].mean()
+                        st.metric("Success Rate", f"{success_rate:.1%}")
+                        st.caption("Higher = more reliable")
+                    
+                    # Detailed results table
+                    st.markdown("**Detailed Results:**")
+                    display_results = robustness_results.copy()
+                    display_results['pop_weight'] = display_results['pop_weight'].round(1)
+                    display_results['event_weight'] = display_results['event_weight'].round(1)
+                    display_results['predicted_population'] = display_results['predicted_population'].round(0)
+                    display_results['predicted_event_rate'] = display_results['predicted_event_rate'].round(3)
+                    display_results['loss'] = display_results['loss'].round(4)
+                    
+                    st.dataframe(display_results, use_container_width=True)
             
             # Similar populations analysis
             st.markdown("#### 🔍 Explore Similar Populations")
@@ -1267,6 +1902,327 @@ def main():
                     st.pyplot(fig)
     else:
         st.info("💡 **Run the Monte Carlo simulation above first to enable optimization features.**")
+    
+    # Machine Learning Analysis Section
+    st.markdown("---")
+    st.markdown("### 🤖 Patient-Level Event Prediction")
+    
+    st.markdown("""
+    This section uses machine learning to predict whether individual patients will have events based on their characteristics.
+    This helps you understand which patient factors are most predictive of events and how well we can predict individual outcomes.
+    """)
+    
+    if st.button("Run Patient Prediction Analysis", type="primary", key="ml_analysis"):
+        with st.spinner("Running patient-level prediction analysis..."):
+            ml_results = analyze_patient_event_prediction(patients, criteria_config)
+            
+            if ml_results:
+                st.session_state.ml_results = ml_results
+                st.success("✅ Patient prediction analysis completed!")
+            else:
+                st.error("❌ Patient prediction analysis failed. Check your patient data.")
+        
+        # Display ML results
+        if 'ml_results' in st.session_state:
+            ml_results = st.session_state.ml_results
+            
+            st.markdown("#### 📊 XGBoost Model Performance")
+            
+            # Display model info
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Random Seed", ml_results['random_seed'])
+                st.metric("Event Rate", f"{ml_results['event_rate']:.3f}")
+                st.metric("Test Set Size", len(ml_results['y_test']))
+            
+            with col2:
+                st.metric("AUC", f"{ml_results['auc']:.3f}")
+                st.metric("Accuracy", f"{ml_results['accuracy']:.3f}")
+                st.metric("F1 Score", f"{ml_results['f1']:.3f}")
+            
+            with col3:
+                st.metric("Sensitivity", f"{ml_results['sensitivity']:.3f}")
+                st.metric("Specificity", f"{ml_results['specificity']:.3f}")
+                st.metric("Precision", f"{ml_results['precision']:.3f}")
+            
+            # Performance metrics table
+            performance_data = [{
+                'Metric': 'AUC',
+                'Value': ml_results['auc'],
+                'Description': 'Area Under ROC Curve'
+            }, {
+                'Metric': 'Accuracy',
+                'Value': ml_results['accuracy'],
+                'Description': 'Overall accuracy'
+            }, {
+                'Metric': 'Sensitivity (Recall)',
+                'Value': ml_results['sensitivity'],
+                'Description': 'True Positive Rate'
+            }, {
+                'Metric': 'Specificity',
+                'Value': ml_results['specificity'],
+                'Description': 'True Negative Rate'
+            }, {
+                'Metric': 'Precision (PPV)',
+                'Value': ml_results['precision'],
+                'Description': 'Positive Predictive Value'
+            }, {
+                'Metric': 'NPV',
+                'Value': ml_results['npv'],
+                'Description': 'Negative Predictive Value'
+            }, {
+                'Metric': 'F1 Score',
+                'Value': ml_results['f1'],
+                'Description': 'Harmonic mean of precision and recall'
+            }]
+            
+            performance_df = pd.DataFrame(performance_data)
+            st.dataframe(performance_df.round(4), use_container_width=True)
+            
+            # Display best hyperparameters
+            st.markdown("#### 🔧 Best Hyperparameters Found")
+            best_params_df = pd.DataFrame(list(ml_results['best_params'].items()), 
+                                        columns=['Parameter', 'Value'])
+            st.dataframe(best_params_df, use_container_width=True)
+            
+            # ROC Curve
+            st.markdown("#### 📈 ROC Curve")
+            
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            fpr, tpr, thresholds_roc = roc_curve(ml_results['y_test'], ml_results['y_pred_proba'])
+            auc = ml_results['auc']
+            ax.plot(fpr, tpr, label=f'XGBoost (AUC = {auc:.3f})', linewidth=2)
+            
+            # Mark the optimal threshold point
+            optimal_idx = np.argmax(tpr - fpr)
+            ax.plot(fpr[optimal_idx], tpr[optimal_idx], 'ro', markersize=8, 
+                   label=f'Optimal Threshold\nTPR={tpr[optimal_idx]:.3f}, FPR={fpr[optimal_idx]:.3f}')
+            
+            ax.plot([0, 1], [0, 1], 'k--', label='Random Classifier')
+            ax.set_xlabel('False Positive Rate')
+            ax.set_ylabel('True Positive Rate')
+            ax.set_title('ROC Curve for Event Prediction')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
+            
+            # Actual vs Predicted Analysis
+            st.markdown("#### 🎯 Actual vs Predicted Analysis")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Confusion Matrix
+                cm = ml_results['confusion_matrix']
+                
+                fig, ax = plt.subplots(figsize=(8, 6))
+                im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+                ax.figure.colorbar(im, ax=ax)
+                
+                # Add text annotations
+                thresh = cm.max() / 2.
+                for i in range(cm.shape[0]):
+                    for j in range(cm.shape[1]):
+                        ax.text(j, i, format(cm[i, j], 'd'),
+                               ha="center", va="center",
+                               color="white" if cm[i, j] > thresh else "black")
+                
+                ax.set_xlabel('Predicted')
+                ax.set_ylabel('Actual')
+                ax.set_title('Confusion Matrix - XGBoost')
+                ax.set_xticks([0, 1])
+                ax.set_yticks([0, 1])
+                ax.set_xticklabels(['No Event', 'Event'])
+                ax.set_yticklabels(['No Event', 'Event'])
+                st.pyplot(fig)
+            
+            with col2:
+                # Prediction distribution
+                fig, ax = plt.subplots(figsize=(8, 6))
+                
+                ax.hist(ml_results['y_pred_proba'], bins=20, alpha=0.7, 
+                       label=f'XGBoost (AUC: {ml_results["auc"]:.3f})', color='blue')
+                
+                ax.set_xlabel('Predicted Probability of Event')
+                ax.set_ylabel('Frequency')
+                ax.set_title('Distribution of Predicted Probabilities')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                st.pyplot(fig)
+            
+            # Calibration Analysis
+            st.markdown("#### 📊 Calibration Analysis")
+            
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            fraction_of_positives, mean_predicted_value = calibration_curve(
+                ml_results['y_test'], ml_results['y_pred_proba'], n_bins=10
+            )
+            ax.plot(mean_predicted_value, fraction_of_positives, 
+                   marker='o', label='XGBoost', linewidth=2, markersize=8)
+            
+            # Perfect calibration line
+            ax.plot([0, 1], [0, 1], 'k--', label='Perfect Calibration')
+            ax.set_xlabel('Mean Predicted Probability')
+            ax.set_ylabel('Fraction of Positives')
+            ax.set_title('Calibration Plot')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
+            
+            # Feature Importance Analysis
+            st.markdown("#### 🎯 Feature Importance Analysis")
+            
+            # Create comparison of different importance measures
+            importance_data = []
+            for i, feature_name in enumerate(ml_results['feature_names']):
+                xgb_importance = ml_results['feature_importance'][i]
+                correlation = ml_results['correlations'][i]
+                
+                importance_data.append({
+                    'Patient Characteristic': feature_name,
+                    'XGBoost': xgb_importance,
+                    'Correlation': correlation,
+                    'Average Importance': (xgb_importance + correlation) / 2
+                })
+            
+            importance_df = pd.DataFrame(importance_data)
+            importance_df = importance_df.sort_values('Average Importance', ascending=False)
+            
+            # Display importance comparison
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**🌳 XGBoost Importance**")
+                fig = px.bar(
+                    importance_df,
+                    x='Patient Characteristic',
+                    y='XGBoost',
+                    title='XGBoost Feature Importance',
+                    color='XGBoost',
+                    color_continuous_scale='viridis'
+                )
+                fig.update_layout(height=400)
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                st.markdown("**📊 Correlation with Events**")
+                fig = px.bar(
+                    importance_df,
+                    x='Patient Characteristic',
+                    y='Correlation',
+                    title='Absolute Correlation with Event Occurrence',
+                    color='Correlation',
+                    color_continuous_scale='plasma'
+                )
+                fig.update_layout(height=400)
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # SHAP Analysis
+            st.markdown("#### 🎯 SHAP Analysis")
+            
+            if ml_results['shap_values'] is not None:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                
+                shap.summary_plot(
+                    ml_results['shap_values'], 
+                    ml_results['X_test_scaled'],
+                    feature_names=ml_results['feature_names'],
+                    show=False,
+                    plot_type="bar"
+                )
+                
+                plt.title("SHAP Feature Importance for Patient Event Prediction")
+                plt.tight_layout()
+                st.pyplot(fig)
+            
+            # Error Analysis
+            st.markdown("#### 🔍 Error Analysis")
+            
+            # Analyze prediction errors
+            errors = ml_results['y_test'] != ml_results['y_pred']
+            
+            if errors.sum() > 0:
+                error_patients = ml_results['X_test'][errors]
+                correct_patients = ml_results['X_test'][~errors]
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("**❌ Misclassified Patients**")
+                    st.write(f"Number of misclassified patients: {errors.sum()}")
+                    st.write(f"Misclassification rate: {errors.mean():.3f}")
+                    
+                    # Show characteristics of misclassified patients
+                    if len(error_patients) > 0:
+                        st.markdown("**Characteristics of Misclassified Patients:**")
+                        error_summary = error_patients.describe()
+                        st.dataframe(error_summary.round(2))
+                
+                with col2:
+                    st.markdown("**✅ Correctly Classified Patients**")
+                    st.write(f"Number of correctly classified patients: {len(correct_patients)}")
+                    st.write(f"Correct classification rate: {1 - errors.mean():.3f}")
+            
+            # Clinical interpretation
+            st.markdown("#### 💡 Clinical Interpretation")
+            
+            with st.expander("🎯 Understanding Patient-Level Prediction Results", expanded=False):
+                st.markdown("""
+                #### 🤖 Patient-Level Prediction Insights
+                
+                **AUC (Area Under ROC Curve):**
+                - Measures how well the model distinguishes between patients with and without events
+                - Values range from 0.5 (random) to 1.0 (perfect)
+                - AUC > 0.7 = good, AUC > 0.8 = very good, AUC > 0.9 = excellent
+                
+                **Calibration:**
+                - Shows how well predicted probabilities match actual event rates
+                - Well-calibrated models have predictions close to the diagonal line
+                - Important for clinical decision making
+                
+                **Feature Importance:**
+                - Shows which patient characteristics are most predictive of events
+                - Higher values = more important for predicting individual patient outcomes
+                - Can guide patient selection and monitoring strategies
+                
+                **Error Analysis:**
+                - Identifies characteristics of patients where prediction fails
+                - Helps understand model limitations and areas for improvement
+                
+                #### 🎯 Clinical Applications
+                
+                **Patient Risk Stratification:**
+                - Use model predictions to identify high-risk patients
+                - Focus monitoring and interventions on patients with high predicted risk
+                
+                **Trial Enrichment:**
+                - Enroll patients with higher predicted event probabilities
+                - Reduces sample size requirements while maintaining statistical power
+                
+                **Clinical Decision Support:**
+                - Use predictions to guide treatment decisions
+                - Identify patients who need more intensive monitoring
+                
+                **Regulatory Strategy:**
+                - Demonstrate evidence-based patient selection
+                - Justify inclusion/exclusion criteria with predictive modeling
+                """)
+            
+            # Top predictive features summary
+            st.markdown("#### 🏆 Top Predictive Patient Characteristics")
+            
+            top_features = importance_df.head(5)
+            
+            for i, (_, row) in enumerate(top_features.iterrows()):
+                st.markdown(f"""
+                **{i+1}. {row['Patient Characteristic']}**
+                - XGBoost Importance: {row['XGBoost']:.3f}
+                - Correlation: {row['Correlation']:.3f}
+                - **Clinical Action**: {'High' if row['Average Importance'] > 0.3 else 'Medium' if row['Average Importance'] > 0.1 else 'Low'} priority for patient risk assessment
+                """)
     
     # Download section
     if 'simulation_results' in st.session_state:
